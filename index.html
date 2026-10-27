@@ -1319,16 +1319,97 @@ tkLoad();
 
 var GEM_KEY_STORAGE = 'nghe-noi-a1-gemini-key';
 var GEM_MODEL_STORAGE = 'nghe-noi-a1-gemini-model';
+var GEM_MODELS = [
+  {id:'auto', label:'⚡ 자동 (최적 모델 자동 연결 · 추천)', desc:'내 API 키가 지원하는 가장 빠르고 가성비 좋은 최신 Flash 모델을 자동으로 찾아 연결해요.'},
+  {id:'gemini-3.5-flash-lite', label:'🚀 gemini-3.5-flash-lite (초고속·최고 가성비)', desc:'무료 할당량이 가장 넉넉하고 응답이 빨라 일상 프리토킹에 최적이에요.'},
+  {id:'gemini-3.8-flash', label:'✨ gemini-3.8-flash (최신 주력·정밀 평가)', desc:'문맥 이해와 한국어 문법 교정 해설이 뛰어난 최신 표준 모델이에요.'},
+  {id:'gemini-3.5-flash', label:'📘 gemini-3.5-flash (범용 안정)', desc:'대화와 평가 모두 안정적으로 처리하는 범용 모델이에요.'},
+  {id:'gemini-2.0-flash', label:'🔄 gemini-2.0-flash (호환용)', desc:'구형 프로젝트 키와의 호환을 위한 모델이에요.'}
+];
+var GEM_FALLBACK_ORDER = ['gemini-3.5-flash-lite','gemini-3.8-flash','gemini-3.5-flash','gemini-3.1-flash-lite','gemini-3-flash-preview','gemini-2.0-flash','gemini-flash-latest'];
+var LAST_USED_GEM_MODEL = '';
+
 function getGemKey(){ try{ return (localStorage.getItem(GEM_KEY_STORAGE)||'').trim(); }catch(e){ return ''; } }
 function setGemKey(k){ try{ localStorage.setItem(GEM_KEY_STORAGE, (k||'').trim()); }catch(e){} initAI(); }
-function getGemModel(){ try{ return localStorage.getItem(GEM_MODEL_STORAGE)||'gemini-2.5-flash'; }catch(e){ return 'gemini-2.5-flash'; } }
-function setGemModel(m){ try{ localStorage.setItem(GEM_MODEL_STORAGE, m); }catch(e){} }
+function getGemModel(){
+  try{
+    var m = (localStorage.getItem(GEM_MODEL_STORAGE)||'').trim();
+    /* Migrate retired 2.5 models automatically */
+    if(!m || m==='gemini-2.5-flash' || m==='gemini-2.5-pro') return 'auto';
+    return m;
+  }catch(e){ return 'auto'; }
+}
+function setGemModel(m){ try{ localStorage.setItem(GEM_MODEL_STORAGE, (m||'auto').trim()); }catch(e){} }
+
+/* Fetch supported generateContent models from Google AI Studio for this API key */
+function fetchAvailableGemModels(apiKey){
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models?key=' + encodeURIComponent(apiKey);
+  return fetch(url).then(function(res){
+    if(!res.ok) return res.json().catch(function(){return {};}).then(function(err){
+      var msg = (err && err.error && err.error.message) || ('HTTP '+res.status);
+      throw new Error(msg);
+    });
+    return res.json();
+  }).then(function(data){
+    var list = (data && data.models) || [];
+    var names = [];
+    list.forEach(function(m){
+      var methods = m.supportedGenerationMethods || [];
+      var name = String(m.name||'').replace(/^models\//, '');
+      if(methods.indexOf('generateContent')>=0 && /^gemini/i.test(name) && !/embedding|imagen|veo|tts|audio/i.test(name)){
+        names.push(name);
+      }
+    });
+    return names;
+  });
+}
 
 function makeGeminiSample(apiKey){
+  function buildCandidateList(opts){
+    var sel = getGemModel();
+    var list = [];
+    function add(m){ if(m && list.indexOf(m)<0) list.push(m); }
+    if(sel && sel !== 'auto') add(sel);
+    if(LAST_USED_GEM_MODEL) add(LAST_USED_GEM_MODEL);
+    if(opts && opts.modelTier==='default'){
+      add('gemini-3.8-flash');
+      add('gemini-3.5-flash');
+    }
+    GEM_FALLBACK_ORDER.forEach(add);
+    return list;
+  }
+
+  function callSingleModel(model, contents, wantJson, signal){
+    var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
+    var body = {contents: contents, generationConfig: {temperature: wantJson ? 0.3 : 0.7}};
+    if(wantJson) body.generationConfig.responseMimeType = 'application/json';
+    return fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+      signal: signal
+    }).then(function(res){
+      if(!res.ok){
+        return res.json().catch(function(){return {};}).then(function(err){
+          var msg = (err && err.error && err.error.message) || ('HTTP '+res.status);
+          var status = res.status;
+          if(status===404 || /not found|not supported|deprecated|retired/i.test(msg)){
+            throw {code:'model_not_found', status:status, model:model, message:msg};
+          }
+          if(status===429) throw {code:'rate_limited', status:status, model:model, message:msg};
+          if(status===400 || status===401 || status===403){
+            if(/API_KEY_INVALID|key not valid|API key/i.test(msg)) throw {code:'api_key_invalid', status:status, message:msg};
+            throw {code:'api_error', status:status, model:model, message:msg};
+          }
+          throw {code:'network_error', status:status, model:model, message:msg};
+        });
+      }
+      return res.json();
+    });
+  }
+
   function callGem(input, opts, wantJson){
     opts = opts || {};
-    var model = getGemModel() || (opts.modelTier==='default' ? 'gemini-2.5-pro' : 'gemini-2.5-flash');
-    var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
     var contents = [];
     if(typeof input === 'string'){
       contents.push({role:'user', parts:[{text:input}]});
@@ -1337,24 +1418,38 @@ function makeGeminiSample(apiKey){
         contents.push({role: m.role==='assistant' ? 'model' : 'user', parts:[{text: String(m.content||'')}]});
       });
     }
-    var body = {contents: contents, generationConfig: {temperature: wantJson ? 0.3 : 0.7}};
-    if(wantJson) body.generationConfig.responseMimeType = 'application/json';
-    return fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-      signal: opts.signal
-    }).then(function(res){
-      if(!res.ok){
-        return res.json().catch(function(){return {};}).then(function(err){
-          var msg = (err && err.error && err.error.message) || ('HTTP '+res.status);
-          if(res.status===429) throw {code:'rate_limited', message:msg};
-          if(res.status===400 || res.status===403) throw {code:'api_key_invalid', message:msg};
-          throw {code:'network_error', message:msg};
+    var cands = buildCandidateList(opts);
+    var idx = 0;
+    function tryNext(lastErr){
+      if(idx >= cands.length){
+        return fetchAvailableGemModels(apiKey).then(function(avail){
+          var fresh = avail.filter(function(m){ return cands.indexOf(m)<0; });
+          if(fresh.length){
+            /* Prefer flash model if available */
+            var pick = fresh.filter(function(m){return /flash/i.test(m);})[0] || fresh[0];
+            return callSingleModel(pick, contents, wantJson, opts.signal).then(function(data){
+              LAST_USED_GEM_MODEL = pick;
+              return data;
+            });
+          }
+          throw lastErr || {code:'network_error', message:'사용 가능한 모델을 찾지 못했어요.'};
+        }, function(){
+          throw lastErr || {code:'network_error', message:'연결 실패'};
         });
       }
-      return res.json();
-    }).then(function(data){
+      var m = cands[idx++];
+      return callSingleModel(m, contents, wantJson, opts.signal).then(function(data){
+        LAST_USED_GEM_MODEL = m;
+        return data;
+      }, function(err){
+        /* If model is retired/not found or unsupported, automatically try the next model! */
+        if(err && (err.code==='model_not_found' || err.code==='api_error')){
+          return tryNext(err);
+        }
+        throw err;
+      });
+    }
+    return tryNext(null).then(function(data){
       var cand = data && data.candidates && data.candidates[0];
       var parts = cand && cand.content && cand.content.parts || [];
       var txt = parts.map(function(p){return p.text||'';}).join('').trim();
@@ -1660,11 +1755,15 @@ function sampleJSON(input, opts){
 }
 var TK_DENY={not_granted:1, sampling_disabled:1, not_declared:1, capability_disabled:1, capability_removed:1};
 function tkFail(e){
-  var c=e && e.code;
+  var c=e && e.code, msg = (e && e.message) ? ' ('+String(e.message).slice(0,60)+')' : '';
   if(c==='cancelled') return;
   if(TK_DENY[c]){ SAMPLE_STATE='denied'; toast(c==='not_granted'?'Claude 사용을 허용하지 않아 AI 대화를 쓸 수 없어요':'이 계정에서는 AI 대화를 쓸 수 없어요'); return; }
-  toast({api_key_invalid:'Gemini API 키가 올바르지 않아요. 프리토킹 화면의 API 설정에서 키를 다시 확인해 주세요', rate_limited:'요청이 많거나 사용 한도에 닿았어요. 잠시 뒤 다시 해 주세요', session_expired:'다시 로그인한 뒤 열어 주세요', refused:'이 내용에는 AI가 답하지 않았어요. 다른 말로 해 보세요',
-         invalid_json:'AI 답을 읽지 못했어요. 다시 눌러 주세요', prompt_too_large:'대화가 너무 길어요. 평가를 받고 새로 시작해 주세요', empty_completion:'AI가 빈 답을 보냈어요. 다시 눌러 주세요'}[c] || '연결이 잠시 끊겼어요. 다시 눌러 주세요');
+  if(c==='api_key_invalid' && /^AQ\./i.test(getGemKey())){
+    toast('AQ.로 시작하는 키가 거부되었어요. Google AI Studio(aistudio.google.com/app/apikey)에서 AIzaSy... 형식의 표준 API 키로 발급받아 입력해 보세요.');
+    return;
+  }
+  toast({api_key_invalid:'Gemini API 키가 올바르지 않아요. API 설정에서 키를 다시 확인해 주세요'+msg, rate_limited:'요청이 많거나 사용 한도에 닿았어요. 잠시 뒤 다시 해 주세요', session_expired:'다시 로그인한 뒤 열어 주세요', refused:'이 내용에는 AI가 답하지 않았어요. 다른 말로 해 보세요',
+         invalid_json:'AI 답을 읽지 못했어요. 다시 눌러 주세요', prompt_too_large:'대화가 너무 길어요. 평가를 받고 새로 시작해 주세요', empty_completion:'AI가 빈 답을 보냈어요. 다시 눌러 주세요'}[c] || ('연결 오류: ' + (e && e.message ? String(e.message).slice(0,70) : '잠시 뒤 다시 시도해 주세요')));
 }
 
 /* ---- textbook match (so a suggestion that IS in the book gets its page) ---- */
@@ -1683,15 +1782,23 @@ function srcBadge(vi){
 function renderTalkHome(){
   var n=state.settings.upto, p=TK.pref, h=topBar('AI 대화 상대와 베트남어 프리토킹');
   if(!tkTopic(p.topic).rx && tkTopic(p.topic).ch>n) p.topic='free';
-  var gKey = getGemKey();
-  if(AI_MODE==='gemini') h+='<div class="banner" style="margin-top:12px"><span style="font-size:14px">✨ <b>Gemini AI 연결됨</b> · 실시간 맞춤 프리토킹 및 정밀 평가가 작동해요.</span><button class="btn small ghost" data-act="toggle-api-box">API 설정</button></div>';
+  var gKey = getGemKey(), curMod = getGemModel();
+  var modLabel = curMod==='auto' ? (LAST_USED_GEM_MODEL ? '자동 ('+LAST_USED_GEM_MODEL+')' : '자동 연결') : curMod;
+  if(AI_MODE==='gemini') h+='<div class="banner" style="margin-top:12px"><span style="font-size:14px">✨ <b>Gemini AI 연결됨</b> · 모델: <b class="vi">'+esc(modLabel)+'</b></span><button class="btn small ghost" data-act="toggle-api-box">API·모델 설정</button></div>';
   else if(AI_MODE==='claude') h+='<div class="banner" style="margin-top:12px"><span style="font-size:14px">✨ <b>Claude AI 연결됨</b> · 프리토킹 및 정밀 평가가 작동해요.</span></div>';
-  else h+='<div class="banner" style="margin-top:12px;background:var(--ochre-soft)"><span style="font-size:13.5px">💡 현재 <b>오프라인 기본 튜터 모드</b>로 바로 연습할 수 있어요. <b>Google Gemini API 키</b>를 입력하면 실시간 AI 프리토킹과 정밀 문장 교정이 켜져요!</span><button class="btn small" data-act="toggle-api-box">API 키 입력</button></div>';
+  else h+='<div class="banner" style="margin-top:12px;background:var(--ochre-soft)"><span style="font-size:13.5px">💡 현재 <b>오프라인 기본 튜터 모드</b>예요. <b>Google Gemini API 키</b>를 입력하면 실시간 AI 프리토킹과 정밀 문장 교정이 켜져요!</span><button class="btn small" data-act="toggle-api-box">API·모델 설정</button></div>';
+  var isPreset = GEM_MODELS.some(function(m){return m.id===curMod;});
   h+='<div id="gem-api-box" class="api-box"'+(TK.showApiBox?'':' hidden')+'>'+
-     '<div style="font-weight:700;font-size:14px">Google Gemini API 연결 설정 (이 기기에만 저장)</div>'+
-     '<div class="faint" style="font-size:12.5px">Google AI Studio(aistudio.google.com)에서 무료 발급받은 API 키를 넣으면 어디서든 제한 없이 Gemini 프리토킹과 정밀 평가를 쓸 수 있어요.</div>'+
-     '<input id="gem-key-input" type="password" placeholder="AIzaSy... 로 시작하는 Gemini API 키 붙여넣기" value="'+esc(gKey)+'" autocomplete="off">'+
-     '<div class="row" style="flex-wrap:wrap"><button class="btn small primary" data-act="save-gem-key">저장 및 연결</button>'+(gKey?'<button class="btn small ghost" data-act="clear-gem-key">키 지우기</button>':'')+'<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" class="gt" style="margin-left:auto">무료 API 키 발급받기 ↗</a></div>'+
+     '<div style="font-weight:700;font-size:14.5px">Google Gemini API 및 모델 설정 (이 기기에만 저장)</div>'+
+     '<div class="faint" style="font-size:12.5px">1) Google AI Studio에서 발급받은 API 키(<code>AIzaSy...</code> 또는 <code>AQ...</code>)를 입력해 주세요.</div>'+
+     '<input id="gem-key-input" type="password" placeholder="Gemini API 키 붙여넣기 (AIzaSy... 또는 AQ...)" value="'+esc(gKey)+'" autocomplete="off">'+
+     '<div class="faint" style="font-size:12.5px;margin-top:4px">2) 사용할 Gemini 모델을 선택하세요. (선택한 모델이 안 될 경우 자동으로 지원 모델을 찾아 연결해요)</div>'+
+     '<div class="tk-opt">'+GEM_MODELS.map(function(m){
+       return '<button type="button" data-gmodel="'+esc(m.id)+'" aria-pressed="'+(curMod===m.id)+'">'+esc(m.label)+'</button>';
+     }).join('')+'</div>'+
+     '<div class="row" style="gap:6px;margin-top:2px"><input id="gem-custom-model" type="text" placeholder="직접 모델 ID 입력 (예: gemini-3.5-flash-lite)" value="'+esc(isPreset?'':curMod)+'" style="flex:1;min-height:36px;font-size:13px"><button type="button" class="btn small" data-act="check-gem-models">내 키 지원 모델 조회</button></div>'+
+     '<div id="gem-model-status" class="status" hidden></div>'+
+     '<div class="row" style="flex-wrap:wrap;margin-top:4px"><button class="btn small primary" data-act="save-gem-key">저장 및 연결 테스트</button>'+(gKey?'<button class="btn small ghost" data-act="clear-gem-key">키 지우기</button>':'')+'<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" class="gt" style="margin-left:auto">무료 API 키 발급받기 ↗</a></div>'+
      '</div>';
   if(TK.cur && TK.cur.turns.length){
     h+='<div class="banner" style="margin-top:12px"><span style="font-size:14px">진행 중인 대화 · '+esc(tkTopic(TK.cur.topic).ko)+' · '+tkRangeText(TK.cur)+' · '+TK.cur.turns.length+'줄</span><span class="row"><button class="btn small primary" data-act="talk-resume">이어서 하기</button><button class="btn small ghost" data-act="talk-discard">지우기</button></span></div>';
@@ -2057,6 +2164,7 @@ document.addEventListener('click', function(e){
   if((a=t.getAttribute('data-tmode'))){ TK.pref.mode=a; tkSave(); render(); return; }
   if((a=t.getAttribute('data-ttier'))){ TK.pref.tier=a; tkSave(); render(); return; }
   if((a=t.getAttribute('data-tko'))){ TK.pref.ko=a; tkSave(); render(); return; }
+  if((a=t.getAttribute('data-gmodel'))){ setGemModel(a); LAST_USED_GEM_MODEL=''; render(); return; }
   if((a=t.getAttribute('data-tkko'))!==null){ TK.koOpen[a]=!TK.koOpen[a]; tkUpdate(false); return; }
   if((a=t.getAttribute('data-tkwords'))!==null){ TK.wOpen[a]=!TK.wOpen[a]; tkUpdate(false); if(TK.wOpen[a]){ var wl=document.querySelectorAll('#tk-list .tk-msg')[+a]; var ww=wl&&wl.querySelector('.tk-words'); if(ww&&ww.scrollIntoView) ww.scrollIntoView({block:'nearest'}); } return; }
   if((a=t.getAttribute('data-tkuse'))!==null){ tkUseHint(+a); return; }
@@ -2087,8 +2195,49 @@ document.addEventListener('click', function(e){
     case 'talk-start': tkStart(); break;
     case 'talk-mic': sttToggle(); break;
     case 'toggle-api-box': TK.showApiBox=!TK.showApiBox; render(); break;
-    case 'save-gem-key': var gki=document.getElementById('gem-key-input'); if(gki){ setGemKey(gki.value); TK.showApiBox=false; toast(getGemKey()?'Gemini API 키를 저장했어요!':'오프라인 기본 튜터 모드로 전환했어요'); render(); } break;
-    case 'clear-gem-key': setGemKey(''); TK.showApiBox=false; toast('API 키를 지웠어요'); render(); break;
+    case 'check-gem-models':
+      var gki0=document.getElementById('gem-key-input'), stBox=document.getElementById('gem-model-status');
+      var k0=(gki0 && gki0.value || getGemKey()).trim();
+      if(!k0){ toast('먼저 위에 API 키를 입력해 주세요'); break; }
+      if(stBox){ stBox.hidden=false; stBox.className='status'; stBox.textContent='내 API 키로 사용 가능한 모델 목록을 조회하고 있어요…'; }
+      fetchAvailableGemModels(k0).then(function(list){
+        if(!stBox) return;
+        if(!list.length){ stBox.className='status warn'; stBox.textContent='호출 가능한 Gemini 모델을 찾지 못했어요.'; return; }
+        stBox.className='status ok';
+        stBox.innerHTML='<b>사용 가능한 모델 ('+list.length+'개)</b> — 눌러서 바로 선택하세요:<div class="tk-opt" style="margin-top:6px">'+list.slice(0,12).map(function(m){
+          return '<button type="button" data-gmodel="'+esc(m)+'" aria-pressed="'+(getGemModel()===m)+'">'+esc(m)+'</button>';
+        }).join('')+'</div>';
+      }, function(err){
+        if(!stBox) return;
+        stBox.className='status warn';
+        var em = String(err && err.message || '');
+        if(/^AQ\./i.test(k0)) em += ' · 💡 참고: AQ.로 시작하는 키가 Vertex/OAuth 전용 키인 경우 브라우저 직접 호출이 거부될 수 있어요. aistudio.google.com/app/apikey 에서 생성한 키인지 확인해 보세요.';
+        stBox.textContent='조회 실패: '+em;
+      });
+      break;
+    case 'save-gem-key':
+      var gki=document.getElementById('gem-key-input'), gcm=document.getElementById('gem-custom-model'), stBox2=document.getElementById('gem-model-status');
+      var cmVal = (gcm && gcm.value || '').trim();
+      if(cmVal) setGemModel(cmVal);
+      if(gki){
+        var kv = gki.value.trim();
+        setGemKey(kv);
+        if(!kv){ TK.showApiBox=false; toast('오프라인 기본 튜터 모드로 전환했어요'); render(); break; }
+        if(stBox2){ stBox2.hidden=false; stBox2.className='status'; stBox2.textContent='연결 테스트 중이에요…'; }
+        SAMPLE('Reply with one word: OK', {modelTier:'quick'}).then(function(){
+          TK.showApiBox=false;
+          toast('✨ 연결 성공! ('+(LAST_USED_GEM_MODEL||getGemModel())+')');
+          render();
+        }, function(err){
+          if(stBox2){
+            stBox2.hidden=false; stBox2.className='status warn';
+            stBox2.textContent='연결 실패: '+String(err && err.message || 'API 키 또는 모델 권한을 확인해 주세요.');
+          }
+          tkFail(err);
+        });
+      }
+      break;
+    case 'clear-gem-key': setGemKey(''); LAST_USED_GEM_MODEL=''; TK.showApiBox=false; toast('API 키를 지웠어요'); render(); break;
     case 'talk-send': tkSend(); break;
     case 'talk-hint': tkHint(); break;
     case 'talk-hint-close': TK.hints=null; tkUpdate(false); break;
